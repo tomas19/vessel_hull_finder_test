@@ -19,6 +19,7 @@ dependencies = [
     "numpy",
     "pandas",
     "streamlit",
+    "matplotlib"
 ]
 
 authors = [
