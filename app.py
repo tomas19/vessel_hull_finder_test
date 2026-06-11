@@ -45,18 +45,43 @@ def load_data() -> pd.DataFrame:
     return df
 
 
+def _relative_distance(
+    values: pd.Series, lo: float, hi: float, target: float
+) -> pd.Series:
+    """Relative distance of *values* to the search criterion for one dimension.
+
+    For a specific value (``lo == hi == target``) this is the absolute relative
+    difference ``|target - value| / target``. For an interval (``lo < hi``) any
+    value inside ``[lo, hi]`` scores 0 and values outside are measured by their
+    relative distance to the nearest bound (scaled by the interval midpoint).
+    """
+    below = (lo - values).clip(lower=0)
+    above = (values - hi).clip(lower=0)
+    return (below + above) / target
+
+
 def compute_similarity(
     df: pd.DataFrame,
-    target_loa: float,
-    target_beam: float,
-    target_height: float,
+    loa: tuple[float, float, float],
+    beam: tuple[float, float, float],
+    height: tuple[float, float, float],
 ) -> pd.DataFrame:
-    """Return a copy of *df* with scaling factors and a similarity score."""
+    """Return a copy of *df* with scaling factors and a similarity score.
+
+    Each dimension is given as a ``(lo, hi, target)`` triple. ``target`` is the
+    representative value used for the scaling factors (the specific value, or the
+    interval midpoint); ``lo``/``hi`` bound the acceptable interval (equal to the
+    target for a specific-value search).
+    """
+    loa_lo, loa_hi, loa_target = loa
+    beam_lo, beam_hi, beam_target = beam
+    height_lo, height_hi, height_target = height
+
     out = df.copy()
 
-    out["Scale LOA"] = target_loa / out["LOA [m]"]
-    out["Scale Beam"] = target_beam / out["Beam [m]"]
-    out["Scale Height"] = target_height / out["Height [m]"]
+    out["Scale LOA"] = loa_target / out["LOA [m]"]
+    out["Scale Beam"] = beam_target / out["Beam [m]"]
+    out["Scale Height"] = height_target / out["Height [m]"]
 
     out["Uniform Scale"] = np.cbrt(
         out["Scale LOA"] * out["Scale Beam"] * out["Scale Height"]
@@ -65,9 +90,13 @@ def compute_similarity(
     scales = out[["Scale LOA", "Scale Beam", "Scale Height"]]
     out["Scale Spread (CV)"] = scales.std(axis=1) / scales.mean(axis=1)
 
-    out["Rel Diff LOA"] = (target_loa - out["LOA [m]"]) / target_loa
-    out["Rel Diff Beam"] = (target_beam - out["Beam [m]"]) / target_beam
-    out["Rel Diff Height"] = (target_height - out["Height [m]"]) / target_height
+    out["Rel Diff LOA"] = _relative_distance(out["LOA [m]"], loa_lo, loa_hi, loa_target)
+    out["Rel Diff Beam"] = _relative_distance(
+        out["Beam [m]"], beam_lo, beam_hi, beam_target
+    )
+    out["Rel Diff Height"] = _relative_distance(
+        out["Height [m]"], height_lo, height_hi, height_target
+    )
     out["Similarity Distance"] = np.sqrt(
         out["Rel Diff LOA"] ** 2
         + out["Rel Diff Beam"] ** 2
@@ -89,7 +118,7 @@ def style_table(
     def _row_color(row):
         val = row["Similarity Distance"]
         rgba = cmap(norm(val))
-        bg = f"background-color: rgba({int(rgba[0]*255)},{int(rgba[1]*255)},{int(rgba[2]*255)},0.35)"
+        bg = f"background-color: rgba({int(rgba[0] * 255)},{int(rgba[1] * 255)},{int(rgba[2] * 255)},0.35)"
         return [bg] * len(row)
 
     cols = [c for c in DISPLAY_COLS if c in df.columns]
@@ -147,6 +176,74 @@ def render_vessel_details(
             st.dataframe(detail, use_container_width=True, hide_index=True)
 
 
+def dimension_input(
+    label: str,
+    default: float,
+    *,
+    min_value: float,
+    step: float,
+) -> tuple[float, float, float]:
+    """Render a specific-value box plus a min/max interval for one dimension.
+
+    Only one mode is used: if the specific-value box has a value the interval is
+    disabled and ignored; if it is empty the interval boxes become available.
+    Returns a ``(lo, hi, target)`` triple ready for :func:`compute_similarity`.
+    """
+    st.sidebar.markdown(f"**{label}**")
+    specific = st.sidebar.number_input(
+        f"{label} — specific value",
+        min_value=min_value,
+        value=None,
+        step=step,
+        placeholder=f"e.g. {default:g}",
+        key=f"spec_{label}",
+    )
+
+    use_interval = specific is None
+    c_lo, c_hi = st.sidebar.columns(2)
+    lo = c_lo.number_input(
+        "min",
+        min_value=min_value,
+        value=None,
+        step=step,
+        disabled=not use_interval,
+        key=f"lo_{label}",
+    )
+    hi = c_hi.number_input(
+        "max",
+        min_value=min_value,
+        value=None,
+        step=step,
+        disabled=not use_interval,
+        key=f"hi_{label}",
+    )
+
+    if specific is not None:
+        return specific, specific, specific
+
+    if lo is not None and hi is not None:
+        if hi < lo:
+            lo, hi = hi, lo
+        return lo, hi, (lo + hi) / 2.0
+
+    if lo is not None or hi is not None:
+        st.sidebar.warning(
+            f"{label}: enter **both** min and max for an interval. "
+            f"Falling back to default {default:g}."
+        )
+
+    return default, default, default
+
+
+def _criterion_caption(
+    label: str, triple: tuple[float, float, float], unit: str
+) -> str:
+    lo, hi, _ = triple
+    if lo == hi:
+        return f"{label} = {lo:g} {unit}"
+    return f"{label} ∈ [{lo:g}, {hi:g}] {unit}"
+
+
 def main() -> None:
     st.set_page_config(page_title="Vessel Hull Finder", layout="wide")
     st.title("🚢 Vessel Hull Finder")
@@ -159,18 +256,28 @@ def main() -> None:
 
     # --- Sidebar inputs ---
     st.sidebar.header("Target vessel")
-    target_loa = st.sidebar.number_input(
-        "LOA [m]", min_value=1.0, value=200.0, step=1.0
+    st.sidebar.caption(
+        "Enter a specific value, **or** leave it empty to search by a min/max "
+        "interval. Only one mode is used per dimension."
     )
-    target_beam = st.sidebar.number_input(
-        "Beam [m]", min_value=0.1, value=32.0, step=0.5
-    )
-    target_height = st.sidebar.number_input(
-        "Height [m]", min_value=0.1, value=18.0, step=0.5
-    )
+    loa = dimension_input("LOA [m]", 200.0, min_value=1.0, step=1.0)
+    beam = dimension_input("Beam [m]", 32.0, min_value=0.1, step=0.5)
+    height = dimension_input("Height [m]", 18.0, min_value=0.1, step=0.5)
 
+    st.sidebar.divider()
     vessel_types = sorted(df_raw["Vessel Type"].dropna().unique(), key=str.lower)
     selected_type = st.sidebar.selectbox("Vessel Type", options=vessel_types)
+
+    st.caption(
+        "Searching for: "
+        + " · ".join(
+            [
+                _criterion_caption("LOA", loa, "m"),
+                _criterion_caption("Beam", beam, "m"),
+                _criterion_caption("Height", height, "m"),
+            ]
+        )
+    )
 
     # --- Split into same type / other types ---
     df_complete = df_raw.dropna(subset=["LOA [m]", "Beam [m]", "Height [m]"])
@@ -178,9 +285,7 @@ def main() -> None:
         st.warning("No vessels with complete dimensions in the database.")
         return
 
-    all_results = compute_similarity(
-        df_complete, target_loa, target_beam, target_height
-    )
+    all_results = compute_similarity(df_complete, loa, beam, height)
 
     mask_same = all_results["Vessel Type"].str.lower() == selected_type.lower()
     df_same = (
