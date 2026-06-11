@@ -1,4 +1,4 @@
-LIB = my_library
+LIB = vessel_hull_finder
 
 check: lint typecheck test doctest
 
